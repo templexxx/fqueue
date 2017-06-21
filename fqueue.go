@@ -4,13 +4,11 @@ import "errors"
 
 type cache struct {
 	val interface{}
-	// readable
+	// if readable
 	flag bool
 }
 type queue struct {
-	_padding0 [8]uint64
 	mask      uint32
-	_padding1 [8]uint64
 	buff      []cache
 	_padding2 [8]uint64
 	cons      uint32
@@ -22,7 +20,7 @@ type queue struct {
 var ErrIllegalCap = errors.New("fqueue: the cap must be 1 ~ 2^32")
 
 // cap must be 2^n
-// 队列的大小建议超过 1s 的"瞬间"新增消息或者读取消息的数量
+// advise: the cap of queue should > num of push/get msg in 1s
 func New(n uint8) (q *queue, err error) {
 	if n > 32 || n == 0 {
 		err = ErrIllegalCap
@@ -35,81 +33,51 @@ func New(n uint8) (q *queue, err error) {
 }
 
 const (
-	active_spin     = 3
-	active_spin_cnt = 10
+	// spins loops
+	spins = 10
+	// nop ops in CPU
+	spin_cnt = 300
 )
 
-//go:nosplit
-func doSpin() {
-	spin(active_spin_cnt)
-}
+// status
+const (
+	success     uint8 = 0
+	catchCons   uint8 = 1
+	catchProd   uint8 = 1
+	prodTooFast uint8 = 2
+	consTooFast uint8 = 2
+	spinOut     uint8 = 3
+)
 
-//go:noescape
-func spin(cycles uint32)
-
-func casUint32(addr *uint32, old, new uint32) (swapped bool)
-
-func (q *queue) Push(v interface{}) (ok bool) {
+// push a new msg into queue
+func (q *queue) Push(msg interface{}) (statusCode uint8) {
 
 	mask := q.mask
-
-	// first try
-	cons := q.cons
-	prod := q.prod
-	// if cons catch prod
-	var prodCnt uint32
-	if prod >= cons {
-		prodCnt = prod - cons
-	} else {
-		prodCnt = mask + prod - cons
-	}
-	if prodCnt >= mask {
-		//runtime.Gosched()
-		return false
-	}
-	prodNew := prod + 1
-	if casUint32(&q.prod, prod, prodNew) {
-		cache := &q.buff[prodNew&mask]
-		if !cache.flag {
-			cache.val = v
-			cache.flag = true
-			//runtime.Gosched()
-			return true
-		} else {
-			// 不太可能会到这里，前面已经判断过 cons catch prod
-			//runtime.Gosched()
-			return false
-		}
-
-	}
-
-	// spin try
 	iter := 0
-	for iter < active_spin {
-		cons = q.cons
-		prod = q.prod
+	for iter < spins {
+		cons := q.cons
+		prod := q.prod
 
+		// if catch cons
+		var prodCnt uint32
 		if prod >= cons {
 			prodCnt = prod - cons
 		} else {
 			prodCnt = mask + prod - cons
 		}
 		if prodCnt >= mask {
-			//runtime.Gosched()
-			return false
+			return catchCons
 		}
 
-		prodNew = prod + 1
+		prodNew := prod + 1
 		if casUint32(&q.prod, prod, prodNew) {
 			cache := &q.buff[prodNew&mask]
 			if !cache.flag {
-				cache.val = v
+				cache.val = msg
 				cache.flag = true
-				//runtime.Gosched()
-				return true
+				return success
 			} else {
-				//runtime.Gosched()
-				return false
+				return prodTooFast
 			}
 		} else {
 			doSpin()
@@ -117,58 +85,25 @@ func (q *queue) Push(v interface{}) (ok bool) {
 			continue
 		}
 	}
-	// TODO 是否需要出让时间片
-	//runtime.Gosched()
-	return false
+	return spinOut
 }
 
-func (q *queue) Get() (ok bool, v interface{}) {
+func (q *queue) Get() (statusCode uint8, v interface{}) {
 
 	mask := q.mask
 
-	// first try
-	prod := q.prod
-	cons := q.cons
-	var prodCnt uint32
-	// if prod catch cons
-	if prod >= cons {
-		prodCnt = prod - cons
-	} else {
-		prodCnt = mask + prod - cons
-	}
-
-	if prodCnt < 1 {
-		//runtime.Gosched()
-		return false, nil
-	}
-
-	consNew := cons + 1
-	if casUint32(&q.cons, cons, consNew) {
-		cache := &q.buff[consNew&mask]
-		if cache.flag {
-			v = cache.val
-			cache.val = nil
-			cache.flag = false
-			//runtime.Gosched()
-			return true, v
-		} else {
-			//runtime.Gosched()
-			return false, nil
-		}
-	}
-
 	iter := 0
-	for iter < active_spin {
-		prod = q.prod
-		cons = q.cons
+	for iter < spins {
+		prod := q.prod
+		cons := q.cons
+		var prodCnt uint32
 		if prod >= cons {
 			prodCnt = prod - cons
 		} else {
 			prodCnt = mask + prod - cons
 		}
 		if prodCnt < 1 {
-			//runtime.Gosched()
-			return false, nil
+			return catchProd, nil
 		}
 		consNew := cons + 1
 		if casUint32(&q.cons, cons, consNew) {
@@ -177,11 +112,9 @@ func (q *queue) Get() (ok bool, v interface{}) {
 				v = cache.val
 				cache.val = nil
 				cache.flag = false
-				//runtime.Gosched()
-				return
+				return success, v
 			} else {
-				//runtime.Gosched()
-				return false, nil
+				return consTooFast, nil
 			}
 		} else {
 			doSpin()
@@ -189,6 +122,15 @@ func (q *queue) Get() (ok bool, v interface{}) {
 			continue
 		}
 	}
-	//runtime.Gosched()
-	return false, nil
+	return spinOut, nil
 }
+
+//go:nosplit
+func doSpin() {
+	spin(spin_cnt)
+}
+
+//go:noescape
+func spin(cycles uint32)
+
+func casUint32(addr *uint32, old, new uint32) (swapped bool)
